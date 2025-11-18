@@ -1,5 +1,8 @@
 #include "bpt.h"
 
+off_t n_prime_info(off_t n_offset, int64_t *k_prime_ptr, off_t *n_prime_offset_ptr, int *k_prime_idx_ptr);
+void Coalesce_OR_Redistribution(page *n, off_t n_offset, off_t parent_offset, int64_t k_prime, off_t n_prime_offset, int k_prime_idx);
+
 H_P *hp;
 
 page *rt = NULL; // root is declared as global
@@ -480,7 +483,225 @@ int db_insert(int64_t key, char *value)
     }
 }
 
+void delete_entry(off_t now_node_offset, int64_t k)
+{
+    // 일단 지우기
+    page *n = load_page(now_node_offset);
+    int index;
+    for (int i = 0; i < n->num_of_keys; i++)
+    {
+        if (n->records[i].key == k)
+        {
+            for (int j = i; j < n->num_of_keys - 1; j++)
+            {
+                n->records[j] = n->records[j + 1];
+            }
+            n->num_of_keys--;
+            break;
+        }
+    }
+    pwrite(fd, n, sizeof(page), now_node_offset); // 수정된 리프 노드 저장
+
+    if (n->parent_page_offset == 0) // N이 루트이고, 리프 노드인데
+    {
+        if (n->num_of_keys == 0) // 키가 하나도 없을때
+        {
+            usetofree(now_node_offset); // 노드를 완전히 제거. Free 리스트로 반환
+
+            hp->rpo = 0;
+            pwrite(fd, hp, sizeof(H_P), 0); // 저장
+            free(hp);
+            hp = load_header(0);
+        }
+
+        free(n);
+        return;
+    }
+    else if (n->num_of_keys < 16) // 언더플로우 처리. (절반보다 작을때)
+    {
+        int64_t k_prime;
+        int k_prime_idx;
+        off_t n_prime_offset;
+
+        // N', K' 정보 가져오기
+        off_t parent_offset = n_prime_info(now_node_offset, &k_prime, &n_prime_offset, &k_prime_idx);
+
+        if (parent_offset != 0)
+        {
+            Coalesce_OR_Redistribution(n, now_node_offset, parent_offset, k_prime, n_prime_offset, k_prime_idx); // 병합 또는 재분배 실행
+            return;
+        }
+    }
+}
+
+off_t n_prime_info(off_t n_offset, int64_t *k_prime_ptr, off_t *n_prime_offset_ptr, int *k_prime_idx_ptr)
+{
+    // 현재 노드 N의 부모 읽어오기
+    page *n = load_page(n_offset);
+    off_t parent_offset = n->parent_page_offset;
+    free(n);
+
+    page *p = load_page(parent_offset);
+    int n_idx = -1; // 부모에서 N의 인덱스 찾기
+
+    if (p->next_offset == n_offset) // 부모의 p1이 N을 가리키면
+    {
+        n_idx = -1;
+    }
+    else
+    {
+        for (int i = 0; i < p->num_of_keys; i++)
+        {
+            if (p->b_f[i].p_offset == n_offset)
+            {
+                n_idx = i;
+                break;
+            }
+        }
+    }
+
+    // 형제 노드 N' 지정
+    off_t n_prime_offset = 0;
+    int k_prime_idx = -1; // K' = N과 N'를 구분하는 부모 노드의 키
+
+    if (n_idx > 0) // N' N인 경우
+    {
+        n_prime_offset = p->b_f[n_idx - 1].p_offset;
+        k_prime_idx = n_idx - 1; // K'은 N' 오른쪽에 있는 키
+    }
+    else if (n_idx == -1) // N N'인 경우
+    {
+        n_prime_offset = p->b_f[0].p_offset;
+        k_prime_idx = 0; // K'은 P1과 P2 사이의 K1
+    }
+
+    // 리턴값 반환
+    if (n_prime_offset != 0)
+    {
+        *k_prime_ptr = p->b_f[k_prime_idx].key;
+        *n_prime_offset_ptr = n_prime_offset;
+        *k_prime_idx_ptr = k_prime_idx;
+    }
+    free(p);
+    return parent_offset;
+}
+
+void Coalesce_OR_Redistribution(page *n, off_t n_offset, off_t parent_offset, int64_t k_prime, off_t n_prime_offset, int k_prime_idx)
+{
+    // 1. 노드 로드 및 역할 정의 (n_left, n_right)
+    page *p = load_page(parent_offset);
+    page *n_prime = load_page(n_prime_offset);
+
+    page *n_left, *n_right;
+    off_t n_left_offset, n_right_offset;
+
+    // N' N 설정
+    n_left = n_prime;
+    n_left_offset = n_prime_offset;
+    n_right = n;
+    n_right_offset = n_offset;
+
+    if (n_left->num_of_keys + n_right->num_of_keys <= 31) // Coalesce
+    {
+        // n_left <- n_right 복사
+        int start = n_left->num_of_keys; // 복사가 시작될 인덱스
+        for (int i = 0; i < n_right->num_of_keys; i++)
+        {
+            n_left->records[start + i] = n_right->records[i];
+        }
+        n_left->num_of_keys += n_right->num_of_keys;
+
+        n_left->next_offset = n_right->next_offset;
+        usetofree(n_right_offset); // n_right 노드 해제
+
+        pwrite(fd, n_left, sizeof(page), n_left_offset); // n_left 변경을 디스크에 반영
+
+        free(n_left);
+        free(n_right);
+        free(p);
+
+        delete_entry(parent_offset, k_prime); // 재귀 호출로 부모 P에서 K' 제거
+        return;
+    }
+    else // Redistribution
+    {
+        // n_left -> n_right로 레코드 1개 이동
+        for (int i = n_right->num_of_keys; i > 0; i--)
+        {
+            n_right->records[i] = n_right->records[i - 1];
+        }
+        n_right->records[0] = n_left->records[n_left->num_of_keys - 1]; // n_left의 마지막 레코드를 n_right의 0번 인덱스로 복사
+
+        n_left->num_of_keys--;
+        n_right->num_of_keys++;
+
+        p->b_f[k_prime_idx].key = n_right->records[0].key; // 부모 P의 경계 키 K' 업데이트
+
+        pwrite(fd, n_left, sizeof(page), n_left_offset);
+        pwrite(fd, n_right, sizeof(page), n_right_offset);
+        pwrite(fd, p, sizeof(page), parent_offset);
+
+        free(n_left);
+        free(n_right);
+        free(p);
+        return;
+    }
+}
+
 int db_delete(int64_t key)
 {
+    // key가 삭제될 리프 노드 탐색
+    off_t now = hp->rpo;
+    page *L = load_page(now);
+    while (L->is_leaf != 1)
+    {
+        off_t next_L = 0;
+        int index = L->num_of_keys;
 
+        int i;
+        for (i = 0; i < L->num_of_keys; i++)
+        {
+            if (key <= L->b_f[i].key) // key보다 크거나 같은 최초의 K i+1를 찾음
+                break;
+        }
+
+        if (i == L->num_of_keys) // key가 모든 값보다 큰 경우. 가장 마지막 포인터로 이동
+            next_L = L->b_f[L->num_of_keys - 1].p_offset;
+        else if (i == 0) // 첫 번째 탐색에서 멈추는 경우
+        {
+            if (key < L->b_f[0].key) // key가 K1보다 작은 경우 P1으로 이동
+                next_L = L->next_offset;
+            else
+                next_L = L->b_f[0].p_offset; // key == k1인 경우
+        }
+        else
+            next_L = L->b_f[i].p_offset;
+
+        // 이전 페이지 메모리 해제
+        page *prev_c = L;
+        L = load_page(next_L);
+        free(prev_c);
+
+        now = next_L; // 현재 오프셋 갱신
+    }
+
+    int delete_index = -1;
+    for (int i = 0; i < L->num_of_keys; i++)
+    {
+        if (key == L->records[i].key)
+        {
+            delete_index = i;
+            break;
+        }
+    }
+
+    if (delete_index == -1)
+    {
+        free(L);
+        return -1; // 삭제 실패
+    }
+
+    free(L);
+    delete_entry(now, key);
+    return 0;
 } // fin
