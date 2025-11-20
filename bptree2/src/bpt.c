@@ -564,6 +564,13 @@ Records Extract_flag_0()
     R.records = calloc(R.capacity, sizeof(record));
     R.cnt = 0;
 
+    // 레코드 할당 실패 시
+    if (R.records == NULL)
+    {
+        R.capacity = 0;
+        return R;
+    }
+
     off_t root = hp->rpo; // 루트에서 시작
     if (root == 0)
     {
@@ -660,10 +667,20 @@ off_t Construct_internal(off_t first_level_offset, int *num_pointers)
 
     off_t current_offset = first_level_offset;
     page *current_node = load_page(current_offset);
+    if (current_node == NULL) // 로드 실패 시
+    {
+        *num_pointers = 0;
+        return 0;
+    }
 
     // current의 부모 노드 생성
     off_t new_internal_offset = new_page();
     page *new_internal = load_page(new_internal_offset);
+    if (new_internal == NULL) // 로드 실패 시
+    {
+        *num_pointers = 0;
+        return 0;
+    }
     new_internal->is_leaf = 0;
     new_internal->num_of_keys = 0;
     new_internal->parent_page_offset = 0;
@@ -737,6 +754,8 @@ off_t Construct_internal(off_t first_level_offset, int *num_pointers)
         }
         current_offset = next_lower_offset;
         current_node = load_page(current_offset);
+        if (current_node == NULL) // 하위 노드 로드 실패 시 루프 종료
+            break;
     }
 
     // 최종 부모 internal 노드를 디스크에 반영
@@ -781,6 +800,9 @@ void Garbage_Collector_recursive(off_t node_offset)
 
 void db_reorganize()
 {
+    if (hp == NULL) // hp 유효 체크
+        return;
+
     Records R = Extract_flag_0(); // flag가 0인 레코드만 가져오기
     if (R.cnt == 0)
     {

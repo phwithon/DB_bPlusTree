@@ -185,7 +185,13 @@ void start_new_file(record rec) // 디스크 파일 내에 최초의 B+ Tree 구
 
 char *db_find(int64_t key)
 {
+    // root NULL 체크
+    if (hp == NULL || hp->rpo == 0)
+        return NULL;
+
     page *c = load_page(hp->rpo); // root 노드
+    if (c == NULL)
+        return NULL; // 로드 실패시
     while (c->is_leaf != 1)
     {
         off_t next_c = 0;
@@ -217,6 +223,9 @@ char *db_find(int64_t key)
         page *prev_c = c;
         c = load_page(next_c);
         free(prev_c);
+
+        if (c == NULL) // 로드 실패시
+            return NULL;
     }
 
     // leaf 노드 도착
@@ -395,6 +404,8 @@ int db_insert(int64_t key, char *value)
     // key가 들어갈 리프 노드 탐색
     off_t now = hp->rpo;
     page *L = load_page(now);
+    if (L == NULL) // root 로드 실패 시
+        return 1;
     while (L->is_leaf != 1)
     {
         off_t next_L = 0;
@@ -424,6 +435,8 @@ int db_insert(int64_t key, char *value)
         L = load_page(next_L);
         free(prev_c);
 
+        if (L == NULL) // 로드 실패 시
+            return 1;
         now = next_L; // 현재 오프셋 갱신
     }
 
@@ -650,9 +663,15 @@ void Coalesce_OR_Redistribution(page *n, off_t n_offset, off_t parent_offset, in
 
 int db_delete(int64_t key)
 {
+    // root NULL 체크
+    if (hp == NULL || hp->rpo == 0)
+        return -1;
+
     // key가 삭제될 리프 노드 탐색
     off_t now = hp->rpo;
     page *L = load_page(now);
+    if (L == NULL) // 로드 실패 시
+        return -1;
     while (L->is_leaf != 1)
     {
         off_t next_L = 0;
@@ -682,6 +701,8 @@ int db_delete(int64_t key)
         L = load_page(next_L);
         free(prev_c);
 
+        if (L == NULL) // 로드 실패 시
+            return -1;
         now = next_L; // 현재 오프셋 갱신
     }
 
@@ -701,7 +722,6 @@ int db_delete(int64_t key)
         return -1; // 삭제 실패
     }
 
-    free(L);
     delete_entry(now, key);
     return 0;
 } // fin
