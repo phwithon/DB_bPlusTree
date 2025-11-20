@@ -1,5 +1,17 @@
 #include "bpt.h"
 
+// flag가 0인 레코드만 따로 저장하는 구조체
+typedef struct
+{
+    record *records;
+    int cnt; // 유효 레코드 개수
+    int capacity;
+} Records;
+
+Records Extract_flag_0();
+off_t Construct_leaf(Records *R);
+off_t Construct_internal(off_t first_level_offset, int *num_pointers);
+
 H_P *hp;
 
 page *rt = NULL; // root is declared as global
@@ -68,6 +80,7 @@ void reset(off_t off)
     reset->is_leaf = 0;
     reset->num_of_keys = 0;
     reset->next_offset = 0;
+    memset(reset->reserved, 0, sizeof(reset->reserved));
     pwrite(fd, reset, sizeof(page), off);
     free(reset);
     return;
@@ -466,6 +479,7 @@ int db_insert(int64_t key, char *value)
         new_node->is_leaf = 1;
         new_node->num_of_keys = split_cnt;
 
+        memset(new_node->reserved, 0, sizeof(new_node->reserved));
         for (int i = 16; i <= 31; i++)
         {
             new_node->records[i - 16] = T[i];
@@ -543,8 +557,269 @@ int db_delete(int64_t key)
     return 0; // 삭제 마킹 성공
 }
 
+Records Extract_flag_0()
+{
+    Records R;
+    R.capacity = 10000; // 초기 용량 설정
+    R.records = calloc(R.capacity, sizeof(record));
+    R.cnt = 0;
+
+    off_t root = hp->rpo; // 루트에서 시작
+    if (root == 0)
+    {
+        free(R.records);
+        R.records = NULL;
+        R.capacity = 0;
+        return R;
+    }
+
+    page *c = load_page(root);
+    while (c->is_leaf != 1) // 트리의 가장 왼쪽 leaf 노드를 찾는다.
+    {
+        off_t next_offset = c->next_offset; // c가 internal일때는 next_offset이 P1을 가리킨다.
+
+        page *prev_c = c;
+        c = load_page(next_offset);
+        free(prev_c);
+    }
+
+    while (c != NULL)
+    {
+        char *deletion_flags = (char *)c->reserved;
+
+        for (int i = 0; i < c->num_of_keys; i++)
+        {
+            if (deletion_flags[i] == 0) // flag가 0인 레코드만 저장
+            {
+                R.records[R.cnt++] = c->records[i];
+            }
+        }
+
+        off_t next_leaf_offset = c->next_offset; // 다음 leaf 노드로 이동
+        free(c);
+
+        if (next_leaf_offset == 0)
+            c = NULL; // 마지막 리스트
+        else
+            c = load_page(next_leaf_offset);
+    }
+
+    return R;
+}
+
+off_t Construct_leaf(Records *R)
+{
+    off_t first_leaf_offset = 0; // 가장 왼쪽 leaf인 경우
+    off_t prev_leaf_offset = 0;
+    int leaf_max_cnt = 31; // 한 leaf의 최대 레코드 수
+
+    for (int i = 0; i < R->cnt; i += leaf_max_cnt) // 노드 순회
+    {
+        off_t new_leaf_offset = new_page();
+        page *new_leaf = load_page(new_leaf_offset);
+        new_leaf->is_leaf = 1;
+        new_leaf->parent_page_offset = 0;
+        memset(new_leaf->reserved, 0, sizeof(new_leaf->reserved));
+
+        int records_to_copy = leaf_max_cnt;
+        if (i + leaf_max_cnt > R->cnt) // 마지막 leaf 노드일때
+            records_to_copy = R->cnt - i;
+
+        for (int j = 0; j < records_to_copy; j++) // 레코드 순회
+        {
+            new_leaf->records[j] = R->records[i + j]; // 구조체 대입
+        }
+        new_leaf->num_of_keys = records_to_copy;
+
+        // leaf 노드 연결
+        if (first_leaf_offset == 0)
+        {
+            first_leaf_offset = new_leaf_offset;
+        }
+        else
+        {
+            page *prev_leaf = load_page(prev_leaf_offset);
+            prev_leaf->next_offset = new_leaf_offset;
+            pwrite(fd, prev_leaf, sizeof(page), prev_leaf_offset);
+            free(prev_leaf);
+        }
+
+        new_leaf->next_offset = 0; // 마지막 leaf일 경우 0으로 저장됨
+        pwrite(fd, new_leaf, sizeof(page), new_leaf_offset);
+        free(new_leaf);
+
+        prev_leaf_offset = new_leaf_offset;
+    }
+
+    return first_leaf_offset;
+}
+
+off_t Construct_internal(off_t first_level_offset, int *num_pointers)
+{
+    int internal_max_cnt = 248; // 한 internal의 최대 레코드 개수
+
+    off_t current_offset = first_level_offset;
+    page *current_node = load_page(current_offset);
+
+    // current의 부모 노드 생성
+    off_t new_internal_offset = new_page();
+    page *new_internal = load_page(new_internal_offset);
+    new_internal->is_leaf = 0;
+    new_internal->num_of_keys = 0;
+    new_internal->parent_page_offset = 0;
+    new_internal->next_offset = current_offset; // P1에 current_node를 지정
+
+    // 새로운 상위 레벨 구축을 위한 변수
+    off_t first_internal_offset = 0; // 새 레벨의 가장 왼쪽 노드 오프셋
+    off_t prev_internal_offset = 0;
+    int now_cnt = 0; // 이 레벨에 생성된 internal 노드 개수
+
+    while (true)
+    {
+        int64_t k_prime;
+        if (current_node->is_leaf == 1) // 하위 노드가 leaf이면
+        {
+            k_prime = current_node->records[0].key;
+        }
+        else
+        {
+            k_prime = current_node->b_f[0].key; // Internal 노드 (P2에 있는 K1)
+        }
+
+        if (new_internal->num_of_keys >= internal_max_cnt) // 부모 internal 노드가 가득 차면 write 후 새 노드 생성
+        {
+            pwrite(fd, new_internal, sizeof(page), new_internal_offset);
+            free(new_internal);
+
+            // 새 internal 노드 생성 (형제 노드)
+            if (first_internal_offset == 0)
+            {
+                first_internal_offset = new_internal_offset; // 새 레벨의 시작점 저장
+            }
+            else
+            {
+                // 이전 internal 노드를 next_offset으로 업데이트
+                page *prev_internal = load_page(prev_internal_offset);
+                if (prev_internal != NULL)
+                {
+                    prev_internal->next_offset = new_internal_offset;
+                    pwrite(fd, prev_internal, sizeof(page), prev_internal_offset);
+                    free(prev_internal);
+                }
+            }
+            prev_internal_offset = new_internal_offset;
+
+            new_internal_offset = new_page();
+            new_internal = load_page(new_internal_offset);
+            new_internal->is_leaf = 0;
+            new_internal->num_of_keys = 0;
+            new_internal->parent_page_offset = 0;
+            new_internal->next_offset = current_offset; // P1 설정 (하위 노드의 현재 위치)
+
+            now_cnt++; // 생성된 Internal 노드 개수 카운트
+        }
+
+        // K' 삽입
+        new_internal->b_f[new_internal->num_of_keys].key = k_prime;
+        new_internal->b_f[new_internal->num_of_keys].p_offset = current_offset;
+        new_internal->num_of_keys++;
+
+        off_t next_lower_offset = current_node->next_offset; // 다음 형제 노드로 이동
+
+        // current 노드의 부모 업데이트
+        current_node->parent_page_offset = new_internal_offset;
+        pwrite(fd, current_node, sizeof(page), current_offset);
+        free(current_node);
+
+        if (next_lower_offset == 0)
+        {
+            break; // current 노드의 끝
+        }
+        current_offset = next_lower_offset;
+        current_node = load_page(current_offset);
+    }
+
+    // 최종 부모 internal 노드를 디스크에 반영
+    pwrite(fd, new_internal, sizeof(page), new_internal_offset);
+    free(new_internal);
+
+    if (first_internal_offset == 0) // internal이 한개이면
+    {
+        *num_pointers = 1;
+        return new_internal_offset; // 새로 생성된 노드의 오프셋을 Root로 반환
+    }
+    else
+    {
+        *num_pointers = now_cnt + 1;  // 생성된 internal 노드 + 자기 자신
+        return first_internal_offset; // 새 레벨의 시작 오프셋 반환
+    }
+}
+
+void Garbage_Collector_recursive(off_t node_offset)
+{
+    if (node_offset == 0)
+        return;
+
+    page *n = load_page(node_offset);
+    if (n == NULL)
+        return;
+
+    if (n->is_leaf == 0) // internal인 경우 재귀
+    {
+        Garbage_Collector_recursive(n->next_offset); // P1로 재귀
+
+        // P2 이후로 재귀
+        for (int i = 0; i < n->num_of_keys; i++)
+        {
+            Garbage_Collector_recursive(n->b_f[i].p_offset);
+        }
+    }
+
+    free(n);                // 현재 노드 메모리 해제
+    usetofree(node_offset); // free page로 반환
+}
+
 void db_reorganize()
 {
+    Records R = Extract_flag_0(); // flag가 0인 레코드만 가져오기
+    if (R.cnt == 0)
+    {
+        free(R.records);
+        return;
+    }
+
+    // 이전 버전은 청소
+    off_t old_root_offset = hp->rpo;
+    Garbage_Collector_recursive(old_root_offset);
+
+    // 새로운 트리 구축
+    hp->rpo = 0;
+    off_t current_level_offset = Construct_leaf(&R); // Leaf 레벨 구축 완료
+
+    off_t new_root_offset = 0;
+    int node_cnt = 0; // 부모의 internal 노드 개수
+
+    while (true)
+    {
+        off_t next_level_offset = Construct_internal(current_level_offset, &node_cnt); // 부모 레벨의 시작 오프셋
+
+        if (node_cnt == 1) // 노드가 1개면 루트
+        {
+            new_root_offset = next_level_offset;
+            break;
+        }
+
+        // 다음 레벨 구축을 위해 현재 레벨 오프셋을 업데이트
+        current_level_offset = next_level_offset;
+    }
+
+    hp->rpo = new_root_offset; // 최종 루트
+    pwrite(fd, hp, sizeof(H_P), 0);
+
+    free(hp);
+    hp = load_header(0);
+
+    free(R.records);
 }
 
 // fin
